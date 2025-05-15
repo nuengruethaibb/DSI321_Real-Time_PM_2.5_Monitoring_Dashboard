@@ -5,13 +5,15 @@ from datetime import datetime
 import pytz
 from prefect import flow, task
 
+# API และ config
 API_KEY = "43c19ba6aa093146f60b85be89834aa7"
 WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 POLLUTION_URL = "http://api.openweathermap.org/data/2.5/air_pollution"
 
 BATCH_SIZE = 25
-WAIT_BETWEEN_BATCHES = 70  # seconds
+WAIT_BETWEEN_BATCHES = 70  # วินาที
 
+# โหลดข้อมูลจาก API
 @task
 async def fetch_weather_and_pollution(session, row):
     lat = row["lat"]
@@ -22,29 +24,23 @@ async def fetch_weather_and_pollution(session, row):
     try:
         params = {"lat": lat, "lon": lon, "appid": API_KEY, "units": "metric"}
 
-        # Weather API call
         async with session.get(WEATHER_URL, params=params) as weather_resp:
             weather_data = await weather_resp.json()
+        await asyncio.sleep(1)  # ป้องกัน rate limit
 
         if weather_data.get("cod") != 200:
             print(f"[ERROR] Missing weather data for {district}: {weather_data}")
             return None
 
-        await asyncio.sleep(2)
-
-        # Pollution API call
         async with session.get(POLLUTION_URL, params=params) as pollution_resp:
             pollution_data = await pollution_resp.json()
+        await asyncio.sleep(1)
 
         if "list" not in pollution_data or not pollution_data["list"]:
             print(f"[ERROR] Missing pollution data for {district}: {pollution_data}")
             return None
 
-        await asyncio.sleep(2)
-
-        timestamp = datetime.now()
-        thai_tz = pytz.timezone('Asia/Bangkok')
-        created_at = timestamp.replace(tzinfo=thai_tz)
+        timestamp = datetime.now(pytz.timezone('Asia/Bangkok'))
 
         return {
             "timestamp": timestamp,
@@ -52,8 +48,8 @@ async def fetch_weather_and_pollution(session, row):
             "month": timestamp.month,
             "day": timestamp.day,
             "hour": timestamp.hour,
-            "minute": timestamp.minute,
-            "created_at": created_at,
+            "minute": (timestamp.minute // 15) * 15,  # ปัดให้เป็น 0, 15, 30, 45
+            "created_at": timestamp,
             "district": district,
             "province": province,
             "location": weather_data.get("name", district),
@@ -81,6 +77,9 @@ async def fetch_weather_and_pollution(session, row):
     except Exception as e:
         print(f"[ERROR] Exception for {district}: {e}")
         return None
+
+
+# Main flow
 @flow(name="weather-flow", flow_run_name="weather-run", log_prints=True)
 async def main_flow():
     df = pd.read_csv("/home/jovyan/work/districts.csv")
@@ -94,6 +93,7 @@ async def main_flow():
             tasks = [fetch_weather_and_pollution(session, row) for _, row in batch.iterrows()]
             batch_results = await asyncio.gather(*tasks)
             results.extend([r for r in batch_results if r is not None])
+
             if i + BATCH_SIZE < len(df):
                 print(f"Waiting {WAIT_BETWEEN_BATCHES} seconds before next batch...")
                 await asyncio.sleep(WAIT_BETWEEN_BATCHES)
@@ -101,7 +101,7 @@ async def main_flow():
     df_results = pd.DataFrame(results)
     print(df_results)
 
-    # lakeFS credentials from your docker-compose.yml
+    # เขียนข้อมูลลง LakeFS
     ACCESS_KEY = "access_key"
     SECRET_KEY = "secret_key"
     lakefs_endpoint = "http://lakefs-dev:8000/"
@@ -121,5 +121,5 @@ async def main_flow():
     df_results.to_parquet(
         lakefs_s3_path,
         storage_options=storage_options,
-        partition_cols=['year', 'month', 'day', 'hour'],
+        partition_cols=['year', 'month', 'day', 'hour', 'minute'],  # ✅ ทำให้มีแค่ 4 partition ต่อชั่วโมง
     )
